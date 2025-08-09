@@ -35,7 +35,7 @@ class SpotifySdkPlugin : MethodCallHandler, FlutterPlugin, ActivityAware, Plugin
     private val channelName = "spotify_sdk"
     private val loggingTag = "spotify_sdk"
 
-    private val REQUEST_SWAP_CODE = 1337
+    private val REQUEST_SWAP_CODE = 1338
 
     // event channels
     private var playerContextChannel : EventChannel? = null
@@ -117,6 +117,9 @@ class SpotifySdkPlugin : MethodCallHandler, FlutterPlugin, ActivityAware, Plugin
     private var spotifyConnectApi: SpotifyConnectApi? = null
     private var spotifyUserApi: SpotifyUserApi? = null
     private var spotifyImagesApi: SpotifyImagesApi? = null
+
+    private var pendingTokenSwapUrl: String? = null
+
 
     override fun onAttachedToEngine(binding: FlutterPlugin.FlutterPluginBinding) {
         this.applicationContext = binding.applicationContext
@@ -365,6 +368,8 @@ class SpotifySdkPlugin : MethodCallHandler, FlutterPlugin, ActivityAware, Plugin
                 setShowDialog(true)
             }.build()
 
+            pendingTokenSwapUrl = tokenSwapUrl
+
             // Start authentication
             AuthorizationClient.openLoginActivity(activity, REQUEST_SWAP_CODE, request)
         } catch (e: Exception) {
@@ -412,6 +417,63 @@ class SpotifySdkPlugin : MethodCallHandler, FlutterPlugin, ActivityAware, Plugin
             return false
         }
         return when (requestCode) {
+            REQUEST_SWAP_CODE -> {
+                val response = AuthorizationClient.getResponse(resultCode, data)
+                val result = pendingOperation!!.result
+                pendingOperation = null
+    
+                when (response.type) {
+                    AuthorizationResponse.Type.CODE -> {
+                        val code = response.code
+                        val url = pendingTokenSwapUrl
+                        pendingTokenSwapUrl = null
+    
+                        if (url.isNullOrBlank()) {
+                            result.error("swap_missing_url", "No tokenSwapUrl stored", null)
+                            true
+                        } else {
+                            // Do network on a background thread
+                            Thread {
+                                try {
+                                    val body = "code=" + java.net.URLEncoder.encode(code, "UTF-8")
+                                    val conn = (java.net.URL(url).openConnection() as java.net.HttpURLConnection)
+                                    conn.requestMethod = "POST"
+                                    conn.setRequestProperty("Content-Type", "application/x-www-form-urlencoded")
+                                    conn.doOutput = true
+                                    conn.outputStream.use { it.write(body.toByteArray(Charsets.UTF_8)) }
+    
+                                    val status = conn.responseCode
+                                    val stream = if (status in 200..299) conn.inputStream else conn.errorStream
+                                    val resp = stream?.bufferedReader()?.readText() ?: ""
+    
+                                    applicationActivity?.runOnUiThread {
+                                        if (status in 200..299) {
+                                            // Return your server's JSON (access_token, refresh_token, expires_in, ...)
+                                            val map = org.json.JSONObject(resp)
+                                            result.success(map.toMap())
+                                        } else {
+                                            result.error("swap_http_$status", resp, null)
+                                        }
+                                    }
+                                } catch (e: Exception) {
+                                    applicationActivity?.runOnUiThread {
+                                        result.error("swap_failed", e.message, Log.getStackTraceString(e))
+                                    }
+                                }
+                            }.start()
+                            true
+                        }
+                    }
+                    AuthorizationResponse.Type.ERROR -> {
+                        result.error("auth_error", response.error, null)
+                        true
+                    }
+                    else -> {
+                        result.error("auth_cancelled", "User cancelled", null)
+                        true
+                    }
+                }
+            }
             requestCodeAuthentication -> {
                 authFlow(resultCode, data)
                 return true

@@ -1,5 +1,6 @@
 import Flutter
 import SpotifyiOS
+import CommonCrypto
 
 public class SwiftSpotifySdkPlugin: NSObject, FlutterPlugin {
     private static var instance = SwiftSpotifySdkPlugin()
@@ -13,6 +14,30 @@ public class SwiftSpotifySdkPlugin: NSObject, FlutterPlugin {
 
     public var sessionManager: SPTSessionManager?
     private var authCallback: FlutterResult?
+
+    private var pendingCodeVerifier: String?
+    private var pendingResult: FlutterResult?
+
+    // MARK: - PKCE helpers
+    private func randomURLSafeString(_ length: Int = 64) -> String {
+    let chars = Array("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~")
+    var result = ""
+    var rng = SystemRandomNumberGenerator()
+    for _ in 0..<length { result.append(chars.randomElement(using: &rng)!) }
+    return result
+    }
+    private func sha256(_ s: String) -> Data {
+    let data = s.data(using: .utf8)!
+    var hash = [UInt8](repeating: 0, count: Int(CC_SHA256_DIGEST_LENGTH))
+    data.withUnsafeBytes { _ = CC_SHA256($0.baseAddress, CC_LONG(data.count), &hash) }
+    return Data(hash)
+    }
+    private func base64url(_ data: Data) -> String {
+    return data.base64EncodedString()
+        .replacingOccurrences(of: "+", with: "-")
+        .replacingOccurrences(of: "/", with: "_")
+        .replacingOccurrences(of: "=", with: "")
+    }
 
     public static func register(with registrar: FlutterPluginRegistrar) {
         guard playerStateChannel == nil else {
@@ -135,6 +160,43 @@ public class SwiftSpotifySdkPlugin: NSObject, FlutterPlugin {
                 tokenRefreshUrl: nil,
                 result: result
             )
+
+        case "getSwapTokenWithVerifier":
+            guard let args = call.arguments as? [String: Any],
+                    let clientId = args["clientId"] as? String,
+                    let redirectUrl = args["redirectUrl"] as? String,
+                    let scopesString = args["scopes"] as? String
+            else {
+                result(FlutterError(code: "INVALID_ARGUMENTS", message: "Missing args", details: nil))
+                return
+            }
+
+            // Generate PKCE
+            let verifier = randomURLSafeString(64)
+            let challenge = base64url(sha256(verifier))
+            pendingCodeVerifier = verifier
+            pendingResult = result
+
+            // Build authorize URL for PKCE
+            var comps = URLComponents(string: "https://accounts.spotify.com/authorize")!
+            let scope = scopesString.replacingOccurrences(of: ",", with: " ")
+            comps.queryItems = [
+                URLQueryItem(name: "response_type", value: "code"),
+                URLQueryItem(name: "client_id", value: clientId),
+                URLQueryItem(name: "redirect_uri", value: redirectUrl),
+                URLQueryItem(name: "scope", value: scope),
+                URLQueryItem(name: "code_challenge_method", value: "S256"),
+                URLQueryItem(name: "code_challenge", value: challenge)
+            ]
+
+            guard let authURL = comps.url else {
+                result(FlutterError(code: "BAD_URL", message: "Failed to build authorize URL", details: nil))
+                pendingResult = nil; pendingCodeVerifier = nil
+                return
+            }
+
+            // Open the URL (iOS will use ASWebAuthenticationSession under-the-hood)
+            UIApplication.shared.open(authURL, options: [:], completionHandler: nil)
 
         case SpotifySdkConstants.methodIsSpotifyInstalled:
             result(isSpotifyInstalled())
@@ -650,7 +712,7 @@ public class SwiftSpotifySdkPlugin: NSObject, FlutterPlugin {
             }
         }
 
-        sessionManager?.initiateSession(with: spotifyScopes, options: .clientOnly, campaign: "app")
+        sessionManager?.initiateSession(with: spotifyScopes, options: .default, campaign: "app")
     }
 
     public func handleSpotifyCallback(url: URL) {
@@ -688,32 +750,52 @@ extension SwiftSpotifySdkPlugin: SPTSessionManagerDelegate {
         _ application: UIApplication, open url: URL,
         options: [UIApplication.OpenURLOptionsKey: Any] = [:]
     ) -> Bool {
+        if let manager = sessionManager,
+            manager.application(application, open: url, options: options) {
+            return true
+        }
         setAccessTokenFromURL(url: url)
         return true
     }
 
     public func application(
-        _ application: UIApplication, continue userActivity: NSUserActivity,
-        restorationHandler: @escaping ([Any]) -> Void
+    _ application: UIApplication,
+    continue userActivity: NSUserActivity,
+    restorationHandler: @escaping ([Any]) -> Void
     ) -> Bool {
-        guard userActivity.activityType == NSUserActivityTypeBrowsingWeb,
-            let url = userActivity.webpageURL
-        else {
-            connectionStatusHandler?.connectionResult?(
-                FlutterError(
-                    code: "errorConnecting", message: "client id or redirectUrl is invalid",
-                    details: nil))
-            connectionStatusHandler?.tokenResult?(
-                FlutterError(
-                    code: "errorConnecting", message: "client id or redirectUrl is invalid",
-                    details: nil))
-            connectionStatusHandler?.connectionResult = nil
-            connectionStatusHandler?.tokenResult = nil
-            return false
-        }
+    // Let SPTSessionManager try first
+    if let manager = sessionManager,
+        manager.application(application, continue: userActivity, restorationHandler: restorationHandler) {
+        return true
+    }
 
-        setAccessTokenFromURL(url: url)
+    // If we're waiting for a PKCE result (new method), parse ?code= and return both
+    if pendingResult != nil,
+    let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+    let code = components.queryItems?.first(where: { $0.name == "code" })?.value {
+    pendingResult?([
+        "code": code,
+        "codeVerifier": pendingCodeVerifier ?? ""
+    ])
+    pendingResult = nil
+    pendingCodeVerifier = nil
+    return true
+    }
+
+    // Fallback to legacy AppRemote path
+    guard userActivity.activityType == NSUserActivityTypeBrowsingWeb,
+            let url = userActivity.webpageURL else {
+        connectionStatusHandler?.connectionResult?(
+        FlutterError(code: "errorConnecting", message: "client id or redirectUrl is invalid", details: nil))
+        connectionStatusHandler?.tokenResult?(
+        FlutterError(code: "errorConnecting", message: "client id or redirectUrl is invalid", details: nil))
+        connectionStatusHandler?.connectionResult = nil
+        connectionStatusHandler?.tokenResult = nil
         return false
+    }
+
+    setAccessTokenFromURL(url: url)
+    return false
     }
 
     private func setAccessTokenFromURL(url: URL) {

@@ -449,8 +449,7 @@ class SpotifySdkPlugin : MethodCallHandler, FlutterPlugin, ActivityAware, Plugin
                                     applicationActivity?.runOnUiThread {
                                         if (status in 200..299) {
                                             // Return your server's JSON (access_token, refresh_token, expires_in, ...)
-                                            val map = org.json.JSONObject(resp)
-                                            result.success(map.toMap())
+                                            result.success(resp)
                                         } else {
                                             result.error("swap_http_$status", resp, null)
                                         }

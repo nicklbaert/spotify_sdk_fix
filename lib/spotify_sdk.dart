@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:typed_data';
 
 import 'package:flutter/services.dart';
 import 'package:logger/logger.dart';
@@ -186,7 +187,9 @@ class SpotifySdk {
   /// the native platforms.
   static Future<bool> disconnect() async {
     try {
-      return await _channel.invokeMethod(MethodNames.disconnectFromSpotify);
+      final isDisconnected =
+          await _channel.invokeMethod<bool>(MethodNames.disconnectFromSpotify);
+      return isDisconnected ?? false;
     } on Exception catch (e) {
       _logException(MethodNames.disconnectFromSpotify, e);
       rethrow;

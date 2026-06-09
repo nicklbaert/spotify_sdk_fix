@@ -605,10 +605,11 @@ public class SwiftSpotifySdkPlugin: NSObject, FlutterPlugin {
             configuration.tokenRefreshURL = URL(string: tokenRefreshUrl)
         }
 
-        // Initialize session manager if needed
-        if sessionManager == nil {
-            sessionManager = SPTSessionManager(configuration: configuration, delegate: self)
-        }
+        // Always recreate the session manager with the freshly built
+        // configuration. The token swap URL embeds the current user's uid, and a
+        // cached session manager would keep swapping tokens against a stale uid
+        // after the signed-in user changes (e.g. sign out then reconnect).
+        sessionManager = SPTSessionManager(configuration: configuration, delegate: self)
 
         authCallback = result
 
